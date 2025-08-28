@@ -1,5 +1,6 @@
 import streamlit as st
 import pandas as pd
+import xlsxwriter
 import numpy as np
 from io import BytesIO, StringIO
 from pathlib import Path
