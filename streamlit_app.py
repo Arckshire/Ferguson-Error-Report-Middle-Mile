@@ -6,6 +6,7 @@ from io import BytesIO
 from pathlib import Path
 from datetime import datetime
 from zipfile import ZipFile, ZIP_DEFLATED
+import hashlib
 
 # =========================
 # App Meta
@@ -13,6 +14,21 @@ from zipfile import ZipFile, ZIP_DEFLATED
 st.set_page_config(page_title="Ferguson Weekly Report Builder", layout="wide")
 
 REFER_STORE_PATH = Path("refer_store.csv")
+
+# =========================
+# Session helpers
+# =========================
+def df_hash(df: pd.DataFrame) -> str:
+    """Stable hash of a 2-col refer DF after normalization and ordering by ErrorText."""
+    if df is None or df.empty:
+        return ""
+    norm = df.iloc[:, :2].copy()
+    norm.columns = ["ErrorText", "Theme"]
+    norm["ErrorText"] = _norm_series(norm["ErrorText"])
+    norm["Theme"] = _norm_series(norm["Theme"])
+    norm = norm.sort_values("ErrorText", kind="mergesort").reset_index(drop=True)
+    csv_bytes = norm.to_csv(index=False).encode("utf-8")
+    return hashlib.md5(csv_bytes).hexdigest()
 
 # =========================
 # Helpers
@@ -62,6 +78,7 @@ def validate_new_refer(current_refer: pd.DataFrame, new_refer: pd.DataFrame):
     cur["ErrorText"] = _norm_series(cur["ErrorText"]); cur["Theme_old"] = _norm_series(cur["Theme_old"])
     new["ErrorText"] = _norm_series(new["ErrorText"]); new["Theme_new"] = _norm_series(new["Theme_new"])
 
+    # left-join ensures all current keys must be present in new
     left = cur.merge(new, on="ErrorText", how="left")
     missing_mask = left["Theme_new"].isna()
     mismatched_mask = (~missing_mask) & (left["Theme_old"].astype(str) != left["Theme_new"].astype(str))
@@ -172,13 +189,16 @@ def to_zip_csvs(sheets: dict[str, pd.DataFrame], include_refer: bool = False) ->
 st.title("Ferguson Weekly Report Builder")
 st.caption("Download CSVs (zip) or create one Excel workbook. Uses openpyxl only — no xlsxwriter needed.")
 
-# Sidebar: Refer control (NO download of refer)
+# --- Sidebar: Refer control (NO refer download) ---
 st.sidebar.header("Refer Sheet Control (Theme Mapping)")
 
-# Reset & status
+# Reset
 if st.sidebar.button("🔁 Reset Main Refer (delete saved refer_store.csv)"):
     reset_refer()
-    st.sidebar.success("Deleted refer_store.csv. Upload a new Refer to initialize.")
+    # Also clear any remembered hashes
+    st.session_state.pop("refer_hash", None)
+    st.sidebar.success("Deleted refer_store.csv. Upload and initialize a new Refer.")
+
 current_refer_df, refer_status = load_current_refer_df()
 st.sidebar.markdown(f"**Refer status:** {refer_status}")
 if current_refer_df is not None:
@@ -190,62 +210,73 @@ refer_upload = st.sidebar.file_uploader(
     key="refer_upload"
 )
 
-# First-time initialization: if no refer exists, require an upload and auto-persist it
+# Make sure session has a place to remember the active hash
+if "refer_hash" not in st.session_state:
+    st.session_state["refer_hash"] = df_hash(current_refer_df) if current_refer_df is not None else ""
+
+# First-time initialization: explicitly click to set baseline
 if current_refer_df is None:
-    if refer_upload is None:
-        st.warning("No Refer is set yet. Please upload your Refer CSV in the sidebar to initialize the app.")
-        st.stop()
-    try:
-        uploaded_refer = pd.read_csv(refer_upload).iloc[:, :2]
-        uploaded_refer.columns = ["ErrorText", "Theme"]
-        persist_refer_df(uploaded_refer)
-        current_refer_df, refer_status = load_current_refer_df()
-        st.success(f"Refer initialized and saved as main. Rows: {len(current_refer_df)}")
-    except Exception as e:
-        st.error(f"Failed to read/persist uploaded Refer: {e}")
-        st.stop()
-else:
-    # If a refer already exists, allow:
-    # (A) Validate & persist (superset only)
-    # (B) Overwrite directly (skip validation) — useful when you know you want to replace it
-    if refer_upload is not None:
+    st.warning("No Refer is set yet. Please upload your Refer CSV in the sidebar.")
+    if refer_upload is not None and st.sidebar.button("✅ Initialize Refer (save as main)"):
         try:
             uploaded_refer = pd.read_csv(refer_upload).iloc[:, :2]
             uploaded_refer.columns = ["ErrorText", "Theme"]
-
-            st.sidebar.caption(f"Uploaded refer rows: **{len(uploaded_refer)}**")
-
-            missing, mismatched, diff = validate_new_refer(current_refer_df, uploaded_refer)
-            if missing == 0 and mismatched == 0:
-                st.sidebar.success("New Refer contains all current mappings. Click below to persist it.")
-                if st.sidebar.button("✅ Persist NEW Refer as Main (validated)"):
-                    persist_refer_df(uploaded_refer)
-                    current_refer_df, refer_status = load_current_refer_df()
-                    st.sidebar.success("New Refer saved as main.")
-            else:
-                st.sidebar.error(
-                    f"Refer validation failed: missing={missing}, mismatched={mismatched}. "
-                    "The new refer must include all current rows with identical themes."
-                )
-                # Show a quick preview of what's missing/mismatched
-                with st.sidebar.expander("See missing/mismatched details"):
-                    st.write(diff.head(50))
-                if not diff.empty:
-                    st.sidebar.download_button(
-                        "Download validation_diff.csv",
-                        diff.to_csv(index=False).encode("utf-8"),
-                        file_name="validation_diff.csv",
-                        mime="text/csv",
-                    )
-                # Offer a skip-validation overwrite for cases where you KNOW you want to replace it
-                if st.sidebar.button("⚠️ Overwrite Main Refer with Uploaded (skip validation)"):
-                    persist_refer_df(uploaded_refer)
-                    current_refer_df, refer_status = load_current_refer_df()
-                    st.sidebar.success("Overwrote main refer with uploaded file.")
+            persist_refer_df(uploaded_refer)
+            current_refer_df, refer_status = load_current_refer_df()
+            st.session_state["refer_hash"] = df_hash(current_refer_df)
+            st.success(f"Refer initialized and saved as main. Rows: {len(current_refer_df)}")
         except Exception as e:
-            st.sidebar.error(f"Failed to read/validate uploaded Refer: {e}")
+            st.error(f"Failed to read/persist uploaded Refer: {e}")
+        st.stop()
+    else:
+        st.stop()
+else:
+    # A refer exists. Only validate/overwrite when you click a button.
+    if refer_upload is not None:
+        # Read uploaded refer but do nothing unless a button is clicked
+        try:
+            candidate_refer = pd.read_csv(refer_upload).iloc[:, :2]
+            candidate_refer.columns = ["ErrorText", "Theme"]
+            cand_hash = df_hash(candidate_refer)
+            st.sidebar.caption(f"Uploaded refer rows: **{len(candidate_refer)}**")
 
-# Main inputs
+            # Validate & Use
+            if st.sidebar.button("🧪 Validate & Use Uploaded Refer"):
+                # Skip validation if identical to current (same hash)
+                if cand_hash == st.session_state.get("refer_hash", ""):
+                    st.sidebar.info("Uploaded refer is identical to the current main refer. Nothing to update.")
+                else:
+                    missing, mismatched, diff = validate_new_refer(current_refer_df, candidate_refer)
+                    if missing == 0 and mismatched == 0:
+                        persist_refer_df(candidate_refer)
+                        current_refer_df, refer_status = load_current_refer_df()
+                        st.session_state["refer_hash"] = df_hash(current_refer_df)
+                        st.sidebar.success("New Refer saved as main.")
+                    else:
+                        st.sidebar.error(
+                            f"Refer validation failed: missing={missing}, mismatched={mismatched}. "
+                            "The new refer must include all current rows with identical themes."
+                        )
+                        with st.sidebar.expander("See missing/mismatched details"):
+                            st.write(diff.head(50))
+                        st.sidebar.download_button(
+                            "Download validation_diff.csv",
+                            diff.to_csv(index=False).encode("utf-8"),
+                            file_name="validation_diff.csv",
+                            mime="text/csv",
+                        )
+
+            # Force Overwrite (skip validation)
+            if st.sidebar.button("⚠️ Force Overwrite Main Refer (skip validation)"):
+                persist_refer_df(candidate_refer)
+                current_refer_df, refer_status = load_current_refer_df()
+                st.session_state["refer_hash"] = df_hash(current_refer_df)
+                st.sidebar.success("Overwrote main refer with uploaded file.")
+
+        except Exception as e:
+            st.sidebar.error(f"Failed to read uploaded Refer: {e}")
+
+# --- Main inputs ---
 st.subheader("1) Upload CSVs")
 col1, col2, col3 = st.columns(3)
 with col1:
@@ -337,9 +368,7 @@ if run:
     with st.expander("Preview: Server_Tender_Errors"):
         st.dataframe(sheet3, use_container_width=True)
 
-# =========================
-# Optional MERGE utility (upload CSVs -> one Excel)
-# =========================
+# --- Optional merge utility ---
 st.divider()
 st.subheader("Optional: Merge previously-downloaded CSVs into a single Excel")
 mcol1, mcol2, mcol3, mcol4 = st.columns(4)
