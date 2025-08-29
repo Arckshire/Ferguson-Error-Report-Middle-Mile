@@ -5,11 +5,16 @@ import numpy as np
 from io import BytesIO, StringIO
 from pathlib import Path
 from datetime import datetime
+from zipfile import ZipFile, ZIP_DEFLATED
 
-# =============== App Meta ===============
+# =========================
+# App Meta
+# =========================
 st.set_page_config(page_title="Ferguson Weekly Report Builder", layout="wide")
 
-# =============== Embedded Default Refer ===============
+# =========================
+# Embedded default Refer fallback
+# =========================
 DEFAULT_REFER_CSV = """ErrorText,Theme
 # Put exact error text in first column and your theme in second column
 # Example rows (delete or modify as you wish):
@@ -18,7 +23,9 @@ P44(The vendor dispatch service has returned an error.)VENDOR( 08222025 is not i
 
 REFER_STORE_PATH = Path("refer_store.csv")
 
-# =============== Helpers ===============
+# =========================
+# Helpers
+# =========================
 def load_current_refer_df() -> tuple[pd.DataFrame, str]:
     """Load the current main refer (priority: disk -> embedded default)."""
     if REFER_STORE_PATH.exists():
@@ -40,11 +47,11 @@ def _norm_series(s: pd.Series) -> pd.Series:
     return (
         s.astype(str)
          .str.replace(r"\s+", " ", regex=True)  # collapse multi-space
-         .str.replace("\u00A0", " ")            # NBSP to space
+         .str.replace("\u00A0", " ")            # NBSP to normal space
          .str.strip()
     )
 
-def validate_new_refer(current_refer: pd.DataFrame, new_refer: pd.DataFrame) -> tuple[int, int, pd.DataFrame]:
+def validate_new_refer(current_refer: pd.DataFrame, new_refer: pd.DataFrame):
     """
     New refer must contain ALL existing ErrorText rows with IDENTICAL themes.
     Returns (missing_count, mismatched_count, diff_df) for debugging.
@@ -69,124 +76,101 @@ def classify_theme_freeform(msg: str) -> str:
     if not isinstance(msg, str) or not msg.strip():
         return ""
     s = msg.lower()
-
-    # Appointment / scheduling
     if ("not in available pickup dates" in s) or ("available pickup dates" in s) or ("appointment" in s) or ("pickup window" in s) or ("delivery window" in s):
         return "Appointment Window / Scheduling"
-    # Phone / contact
     if ("phone" in s) or ("contact number" in s) or ("call" in s and "contact" in s):
         return "Origin/Destination Phone Number Missing"
-    # Address / location
     if any(k in s for k in ["address", "zipcode", "zip code", "postal", "city", "state", "location invalid", "not serviceable"]):
         return "Origin/Destination Details"
-    # Auth / permission
     if any(k in s for k in ["unauthorized", "forbidden", "authentication", "authorization", "invalid api key", "token"]):
         return "Authentication/Authorization"
-    # Technical / server
-    if any(k in s for k in ["timeout", "timed out", "gateway timeout", "service unavailable", "internal server error", "bad gateway", " 500"]):
+    if any(k in s for k in ["timeout", "timed out", "gateway timeout", "service unavailable", "internal server error", "bad gateway", " 500"]) or "vendor dispatch service" in s:
         return "Technical/Server Error"
-    if "vendor dispatch service" in s:
-        return "Technical/Server Error"
-    # Capacity
     if any(k in s for k in ["no capacity", "capacity full", "over capacity", "not available for pickup"]):
         return "Carrier Capacity"
-    # Data validation
     if any(k in s for k in ["missing", "required", "invalid", "format", "cannot be blank", "must provide"]):
         return "Data Validation"
-    # Reference / ID
     if any(k in s for k in ["not found", "does not exist", "unknown", "reference", " id ", "po ", "bol "]):
         return "Reference/ID Issue"
-    # Freight details
     if any(k in s for k in ["weight", "dimension", "length", "width", "height", "nmfc", "class "]):
         return "Freight Details"
-    # Duplicate / already scheduled
     if any(k in s for k in ["duplicate", "already exists", "already scheduled"]):
         return "Duplicate / Already Scheduled"
-    # Coverage / service area
     if any(k in s for k in ["not in service area", "lane not serviced", "no service in"]):
         return "Coverage / Service Area"
-
     return "Other / Needs Review"
 
 def build_sheet1_dispatch(current_df: pd.DataFrame, last_df: pd.DataFrame) -> pd.DataFrame:
-    # Keep only columns: scac, RequestCount, SuccessPercent
     cur = current_df[["scac", "RequestCount", "SuccessPercent"]].copy()
     last = last_df[["scac", "SuccessPercent"]].copy().rename(columns={"SuccessPercent": "SuccessPercent_last_week"})
-
     out = cur.merge(last, on="scac", how="left")
-    out["Change (Week over Week)"] = np.where(
-        out["SuccessPercent_last_week"].notna(),
-        out["SuccessPercent"] - out["SuccessPercent_last_week"],
-        ""
-    )
+    out["Change (Week over Week)"] = np.where(out["SuccessPercent_last_week"].notna(),
+                                              out["SuccessPercent"] - out["SuccessPercent_last_week"], "")
     out = out.drop(columns=["SuccessPercent_last_week"])
     out["p44 Benchmark - Low"] = ""
     out["p44 Benchmark - High"] = ""
     out["p44 Benchmark - Best in Class"] = ""
-    out = out[
-        ["scac", "RequestCount", "SuccessPercent", "Change (Week over Week)",
-         "p44 Benchmark - Low", "p44 Benchmark - High", "p44 Benchmark - Best in Class"]
-    ]
-    return out
+    return out[[
+        "scac", "RequestCount", "SuccessPercent", "Change (Week over Week)",
+        "p44 Benchmark - Low", "p44 Benchmark - High", "p44 Benchmark - Best in Class"
+    ]]
 
 def build_sheet2_empty() -> pd.DataFrame:
     return pd.DataFrame(columns=["(leave empty, you'll paste here)"])
 
 def build_sheet3_server_errors(server_df: pd.DataFrame, refer_df: pd.DataFrame) -> pd.DataFrame:
-    # Expect first three columns A,B,C where C is a count
     base_cols = server_df.columns.tolist()[:3]
     df = server_df[base_cols].copy()
-
-    # Ensure counts numeric
     if len(base_cols) < 3:
         while len(df.columns) < 3:
             df[f"col_{len(df.columns)+1}"] = ""
         base_cols = df.columns.tolist()[:3]
     count_col = base_cols[2]
     df[count_col] = pd.to_numeric(df[count_col], errors="coerce").fillna(0)
-
-    # % of Total Errors
     total_errors = df[count_col].sum()
     df["% of Total Errors"] = np.where(total_errors > 0, df[count_col] / total_errors, 0.0)
-
-    # Exact match from refer (A:B -> ErrorText, Theme). Lookup key is column B of server errors
     refer_map = dict(zip(refer_df.iloc[:, 0].astype(str).str.strip(), refer_df.iloc[:, 1].astype(str).str.strip()))
     text_col = base_cols[1] if len(base_cols) > 1 else base_cols[0]
     keys = df[text_col].astype(str).str.strip()
-
     exact_theme = keys.map(refer_map).replace({np.nan: ""})
     df["Theme"] = exact_theme
     df["MatchType"] = np.where(df["Theme"].astype(str).str.len() > 0, "Exact", "NotExact")
-
-    # Smart fill for NotExact
     mask = df["MatchType"] == "NotExact"
     df.loc[mask, "Theme"] = df.loc[mask, text_col].astype(str).map(classify_theme_freeform)
-
-    # Needs Review flag for NotExact
     df["Needs Review"] = np.where(df["MatchType"] == "NotExact", "Yes", "")
+    return df[base_cols + ["% of Total Errors", "Theme", "MatchType", "Needs Review"]]
 
-    # Order
-    df = df[base_cols + ["% of Total Errors", "Theme", "MatchType", "Needs Review"]]
-    return df
-
-def to_excel(sheets: dict[str, pd.DataFrame]) -> bytes:
+def to_excel_openpyxl(sheets: dict[str, pd.DataFrame]) -> bytes:
     """
     Write Excel using openpyxl ONLY (no xlsxwriter dependency).
-    This avoids ModuleNotFoundError in environments without xlsxwriter.
     """
     output = BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         for sheet_name, sheet_df in sheets.items():
             sheet_df.to_excel(writer, sheet_name=sheet_name[:31], index=False)
-        # Note: openpyxl doesn't apply conditional formatting here;
-        # data is preserved and ready for your review workflow.
     return output.getvalue()
 
-# =============== UI ===============
-st.title("Ferguson Weekly Report Builder")
-st.caption("Build the 3-sheet weekly workbook + Refer sheet, with Exact/NotExact tagging and smart themes.")
+def to_zip_csvs(sheets: dict[str, pd.DataFrame], include_refer: bool = False) -> bytes:
+    """
+    Create a ZIP of CSVs. By default, excludes Refer to avoid leakage.
+    """
+    buf = BytesIO()
+    with ZipFile(buf, mode="w", compression=ZIP_DEFLATED) as z:
+        for name, df in sheets.items():
+            if name == "Refer" and not include_refer:
+                continue
+            csv_bytes = df.to_csv(index=False).encode("utf-8")
+            z.writestr(f"{name}.csv", csv_bytes)
+    buf.seek(0)
+    return buf.getvalue()
 
-# Sidebar: Refer control (NO download button)
+# =========================
+# UI
+# =========================
+st.title("Ferguson Weekly Report Builder")
+st.caption("Download CSVs (zip) or create one Excel workbook. Uses openpyxl only — no xlsxwriter needed.")
+
+# Sidebar: Refer control (NO download of refer)
 st.sidebar.header("Refer Sheet Control (Theme Mapping)")
 current_refer_df, refer_source = load_current_refer_df()
 st.sidebar.markdown(f"**Current refer source:** {refer_source}")
@@ -237,7 +221,10 @@ with col2:
 with col3:
     server_errors_file = st.file_uploader("Server Tender Response Errors", type=["csv"], key="serr")
 
-run = st.button("Build Workbook")
+output_mode = st.radio("2) Choose output", ["ZIP of CSVs (recommended)", "One Excel workbook (openpyxl)"], index=0)
+include_refer_in_excel = st.checkbox("Include Refer sheet in Excel", value=False)
+
+run = st.button("Build Output")
 
 if run:
     if not (current_week_file and last_week_file and server_errors_file):
@@ -264,26 +251,98 @@ if run:
         st.error(f"Failed to build Sheet 3 (Server Tender Errors): {e}")
         st.stop()
 
-    # Compose workbook — three sheets + Refer
     sheets = {
         "Dispatch_Success_Rate_By_Carrie": sheet1,
         "Shipment_Level_Errors": sheet2,
         "Server_Tender_Errors": sheet3,
-        "Refer": current_refer_df,
+        "Refer": current_refer_df,  # only included if explicitly requested for Excel/ZIP
     }
 
-    xlsx_bytes = to_excel(sheets)
+    if output_mode == "ZIP of CSVs (recommended)":
+        zip_bytes = to_zip_csvs(sheets, include_refer=False)  # keep Refer private by default
+        st.success("ZIP created.")
+        st.download_button(
+            label="Download ZIP of CSVs",
+            data=zip_bytes,
+            file_name=f"Ferguson_Weekly_Report_CSVs_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip",
+            mime="application/zip",
+        )
+    else:
+        try:
+            # Compose workbook with/without Refer
+            sheets_for_excel = {
+                "Dispatch_Success_Rate_By_Carrie": sheet1,
+                "Shipment_Level_Errors": sheet2,
+                "Server_Tender_Errors": sheet3,
+            }
+            if include_refer_in_excel:
+                sheets_for_excel["Refer"] = current_refer_df
 
-    st.success("Workbook built!")
-    st.download_button(
-        label="Download Excel Workbook",
-        data=xlsx_bytes,
-        file_name=f"Ferguson_Weekly_Report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
+            xlsx_bytes = to_excel_openpyxl(sheets_for_excel)
+            st.success("Workbook built!")
+            st.download_button(
+                label="Download Excel Workbook",
+                data=xlsx_bytes,
+                file_name=f"Ferguson_Weekly_Report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        except Exception as e:
+            st.error(f"Excel build failed with openpyxl: {e}")
+            zip_bytes = to_zip_csvs(sheets, include_refer=False)
+            st.info("As a fallback, here's a ZIP of the CSVs.")
+            st.download_button(
+                label="Download ZIP of CSVs",
+                data=zip_bytes,
+                file_name=f"Ferguson_Weekly_Report_CSVs_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip",
+                mime="application/zip",
+            )
 
-    # Previews
+    # Quick previews
     with st.expander("Preview: Dispatch_Success_Rate_By_Carrie"):
         st.dataframe(sheet1, use_container_width=True)
     with st.expander("Preview: Server_Tender_Errors"):
         st.dataframe(sheet3, use_container_width=True)
+
+# =========================
+# Separate MERGE utility (upload CSVs -> one Excel)
+# =========================
+st.divider()
+st.subheader("Optional: Merge previously-downloaded CSVs into a single Excel")
+mcol1, mcol2, mcol3, mcol4 = st.columns(4)
+with mcol1:
+    csv1 = st.file_uploader("Dispatch_Success_Rate_By_Carrie.csv", type=["csv"], key="m1")
+with mcol2:
+    csv2 = st.file_uploader("Shipment_Level_Errors.csv", type=["csv"], key="m2")
+with mcol3:
+    csv3 = st.file_uploader("Server_Tender_Errors.csv", type=["csv"], key="m3")
+with mcol4:
+    refer_csv_optional = st.file_uploader("Optional Refer.csv", type=["csv"], key="m4")
+
+merge_include_refer = st.checkbox("Include Refer CSV in merged Excel", value=False, key="merge_ref")
+if st.button("Create Excel from CSVs"):
+    if not (csv1 and csv2 and csv3):
+        st.error("Please upload the three CSVs.")
+        st.stop()
+    try:
+        s1 = pd.read_csv(csv1)
+        s2 = pd.read_csv(csv2)
+        s3 = pd.read_csv(csv3)
+        sheets_pkg = {
+            "Dispatch_Success_Rate_By_Carrie": s1,
+            "Shipment_Level_Errors": s2,
+            "Server_Tender_Errors": s3,
+        }
+        if merge_include_refer and refer_csv_optional:
+            ref_df = pd.read_csv(refer_csv_optional).iloc[:, :2]
+            ref_df.columns = ["ErrorText", "Theme"]
+            sheets_pkg["Refer"] = ref_df
+        xlsx_bytes2 = to_excel_openpyxl(sheets_pkg)
+        st.success("Merged Excel created.")
+        st.download_button(
+            label="Download Merged Excel",
+            data=xlsx_bytes2,
+            file_name=f"Ferguson_Weekly_Report_MERGED_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+    except Exception as e:
+        st.error(f"Merge failed: {e}")
