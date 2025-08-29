@@ -13,34 +13,51 @@ from zipfile import ZipFile, ZIP_DEFLATED
 st.set_page_config(page_title="Ferguson Weekly Report Builder", layout="wide")
 
 # =========================
-# Embedded default Refer fallback
+# Embedded MASTER Refer (from your uploaded CSV)
+#  - This will be auto-persisted to disk as refer_store.csv on first run.
+#  - No download button anywhere.
 # =========================
 DEFAULT_REFER_CSV = """ErrorText,Theme
-# Put exact error text in first column and your theme in second column
-# Example rows (delete or modify as you wish):
-P44(The vendor dispatch service has returned an error.)VENDOR( 08222025 is not in avaliable pickup dates List 082525082625082725082825.  Please contact dispatch 800-942-9909 to expedite your pick up request.),Appointment Window / Scheduling
+"P44(An error occurred while dispatching this... Windows","Appointment Windows"
+"P44(The vendor has returned an error.)VENDOR(USE U","Appointment Window / Scheduling"
 """
+
+# ^^^ NOTE:
+# I truncated this header to keep the sample short here in chat.
+# In your actual app, paste the ENTIRE CSV I generated for you (the one from your upload).
+# It starts with:
+# ErrorText,Theme
+# "P44(An error occurred while dispatching this... Windows","Appointment Windows"
+# ...
+# and is ~49k characters long. Replace the DEFAULT_REFER_CSV block above with the full text I gave you.
 
 REFER_STORE_PATH = Path("refer_store.csv")
 
 # =========================
 # Helpers
 # =========================
+def persist_refer_df(df: pd.DataFrame) -> None:
+    df = df.iloc[:, :2].copy()
+    df.columns = ["ErrorText", "Theme"]
+    df.to_csv(REFER_STORE_PATH, index=False)
+
 def load_current_refer_df() -> tuple[pd.DataFrame, str]:
-    """Load the current main refer (priority: disk -> embedded default)."""
+    """
+    Load the current main refer.
+    Priority: disk -> embedded default (and bootstrap to disk if not present).
+    """
     if REFER_STORE_PATH.exists():
         df = pd.read_csv(REFER_STORE_PATH).iloc[:, :2]
         df.columns = ["ErrorText", "Theme"]
         ts = datetime.fromtimestamp(REFER_STORE_PATH.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S")
         return df, f"On disk (last updated: {ts})"
+
+    # Bootstrap: persist embedded default as the main refer on first run
     df = pd.read_csv(StringIO(DEFAULT_REFER_CSV), comment="#").iloc[:, :2]
     df.columns = ["ErrorText", "Theme"]
-    return df, "Embedded default"
-
-def persist_refer_df(df: pd.DataFrame) -> None:
-    df = df.iloc[:, :2].copy()
-    df.columns = ["ErrorText", "Theme"]
-    df.to_csv(REFER_STORE_PATH, index=False)
+    persist_refer_df(df)
+    ts = datetime.fromtimestamp(REFER_STORE_PATH.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+    return df, f"Embedded default (bootstrapped to disk: {ts})"
 
 def _norm_series(s: pd.Series) -> pd.Series:
     # Normalize to reduce spurious mismatches for validation
@@ -141,9 +158,7 @@ def build_sheet3_server_errors(server_df: pd.DataFrame, refer_df: pd.DataFrame) 
     return df[base_cols + ["% of Total Errors", "Theme", "MatchType", "Needs Review"]]
 
 def to_excel_openpyxl(sheets: dict[str, pd.DataFrame]) -> bytes:
-    """
-    Write Excel using openpyxl ONLY (no xlsxwriter dependency).
-    """
+    """Write Excel using openpyxl ONLY (no xlsxwriter dependency)."""
     output = BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         for sheet_name, sheet_df in sheets.items():
@@ -151,9 +166,7 @@ def to_excel_openpyxl(sheets: dict[str, pd.DataFrame]) -> bytes:
     return output.getvalue()
 
 def to_zip_csvs(sheets: dict[str, pd.DataFrame], include_refer: bool = False) -> bytes:
-    """
-    Create a ZIP of CSVs. By default, excludes Refer to avoid leakage.
-    """
+    """Create a ZIP of CSVs. By default, excludes Refer to avoid leakage."""
     buf = BytesIO()
     with ZipFile(buf, mode="w", compression=ZIP_DEFLATED) as z:
         for name, df in sheets.items():
@@ -178,7 +191,7 @@ if REFER_STORE_PATH.exists():
     ts = datetime.fromtimestamp(REFER_STORE_PATH.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S")
     st.sidebar.info(f"Main refer last updated: {ts}")
 else:
-    st.sidebar.info("Main refer not yet saved on disk — using embedded default.")
+    st.sidebar.info("Main refer not yet saved on disk — using embedded default (auto-bootstrapped).")
 
 refer_upload = st.sidebar.file_uploader(
     "Optional: Upload a NEW refer CSV (two columns: ErrorText, Theme)",
@@ -304,7 +317,7 @@ if run:
         st.dataframe(sheet3, use_container_width=True)
 
 # =========================
-# Separate MERGE utility (upload CSVs -> one Excel)
+# Optional MERGE utility (upload CSVs -> one Excel)
 # =========================
 st.divider()
 st.subheader("Optional: Merge previously-downloaded CSVs into a single Excel")
