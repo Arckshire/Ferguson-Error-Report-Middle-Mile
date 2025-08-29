@@ -1,9 +1,7 @@
 # streamlit_app.py
-import os
 import streamlit as st
 import pandas as pd
 import numpy as np
-import xlsxwriter
 from io import BytesIO, StringIO
 from pathlib import Path
 from datetime import datetime
@@ -172,46 +170,23 @@ def build_sheet3_server_errors(server_df: pd.DataFrame, refer_df: pd.DataFrame) 
     return df
 
 def to_excel(sheets: dict[str, pd.DataFrame]) -> bytes:
-    """Write Excel. Prefer xlsxwriter (formatting). Fallback to openpyxl if unavailable."""
+    """
+    Write Excel using openpyxl ONLY (no xlsxwriter dependency).
+    This avoids ModuleNotFoundError in environments without xlsxwriter.
+    """
     output = BytesIO()
-    try:
-        import xlsxwriter  # noqa: F401
-        engine = "xlsxwriter"
-    except Exception:
-        engine = "openpyxl"
-
-    with pd.ExcelWriter(output, engine=engine) as writer:
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
         for sheet_name, sheet_df in sheets.items():
             sheet_df.to_excel(writer, sheet_name=sheet_name[:31], index=False)
-
-        # Styling for Server_Tender_Errors only if xlsxwriter is present
-        if engine == "xlsxwriter" and "Server_Tender_Errors" in sheets:
-            wb = writer.book
-            ws = writer.sheets.get("Server_Tender_Errors")
-            if ws is not None:
-                bold = wb.add_format({'bold': True})
-                ws.set_row(0, None, bold)
-                pct_col_idx = list(sheets["Server_Tender_Errors"].columns).index("% of Total Errors")
-                pct_fmt = wb.add_format({'num_format': '0.00%'})
-                ws.set_column(pct_col_idx, pct_col_idx, 14, pct_fmt)
-                review_col_idx = list(sheets["Server_Tender_Errors"].columns).index("Needs Review")
-                ws.conditional_format(
-                    1, 0,
-                    len(sheets["Server_Tender_Errors"]),
-                    len(sheets["Server_Tender_Errors"].columns) - 1,
-                    {
-                        'type': 'formula',
-                        'criteria': f'=${chr(65 + review_col_idx)}2="Yes"',
-                        'format': wb.add_format({'bg_color': '#FFF2CC'})
-                    }
-                )
+        # Note: openpyxl doesn't apply conditional formatting here;
+        # data is preserved and ready for your review workflow.
     return output.getvalue()
 
 # =============== UI ===============
 st.title("Ferguson Weekly Report Builder")
 st.caption("Build the 3-sheet weekly workbook + Refer sheet, with Exact/NotExact tagging and smart themes.")
 
-# Sidebar: Refer control
+# Sidebar: Refer control (NO download button)
 st.sidebar.header("Refer Sheet Control (Theme Mapping)")
 current_refer_df, refer_source = load_current_refer_df()
 st.sidebar.markdown(f"**Current refer source:** {refer_source}")
@@ -251,8 +226,6 @@ if refer_upload is not None:
                 )
     except Exception as e:
         st.sidebar.error(f"Failed to read/validate uploaded refer: {e}")
-
-# (Intentionally NO 'Download refer.csv' button to keep refer private)
 
 # Main inputs
 st.subheader("1) Upload CSVs")
