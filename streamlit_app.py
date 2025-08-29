@@ -35,12 +35,17 @@ def load_current_refer_df():
         return df, f"On disk (last updated: {ts})"
     return None, "Not set — please upload a Refer CSV to initialize."
 
+def reset_refer():
+    """Delete the stored refer file if present."""
+    if REFER_STORE_PATH.exists():
+        REFER_STORE_PATH.unlink()
+
 def _norm_series(s: pd.Series) -> pd.Series:
     # Normalize to reduce spurious mismatches for validation
     return (
         s.astype(str)
          .str.replace(r"\s+", " ", regex=True)  # collapse multi-space
-         .str.replace("\u00A0", " ")            # NBSP to space
+         .str.replace("\u00A0", " ")            # NBSP to normal space
          .str.strip()
     )
 
@@ -169,8 +174,15 @@ st.caption("Download CSVs (zip) or create one Excel workbook. Uses openpyxl only
 
 # Sidebar: Refer control (NO download of refer)
 st.sidebar.header("Refer Sheet Control (Theme Mapping)")
+
+# Reset & status
+if st.sidebar.button("🔁 Reset Main Refer (delete saved refer_store.csv)"):
+    reset_refer()
+    st.sidebar.success("Deleted refer_store.csv. Upload a new Refer to initialize.")
 current_refer_df, refer_status = load_current_refer_df()
 st.sidebar.markdown(f"**Refer status:** {refer_status}")
+if current_refer_df is not None:
+    st.sidebar.caption(f"Current refer rows: **{len(current_refer_df)}**")
 
 refer_upload = st.sidebar.file_uploader(
     "Upload Refer CSV (two columns: ErrorText, Theme)",
@@ -188,20 +200,25 @@ if current_refer_df is None:
         uploaded_refer.columns = ["ErrorText", "Theme"]
         persist_refer_df(uploaded_refer)
         current_refer_df, refer_status = load_current_refer_df()
-        st.success("Refer initialized and saved as main.")
+        st.success(f"Refer initialized and saved as main. Rows: {len(current_refer_df)}")
     except Exception as e:
         st.error(f"Failed to read/persist uploaded Refer: {e}")
         st.stop()
 else:
-    # If a refer already exists, allow replacing it with a superset that matches all current rows/themes.
+    # If a refer already exists, allow:
+    # (A) Validate & persist (superset only)
+    # (B) Overwrite directly (skip validation) — useful when you know you want to replace it
     if refer_upload is not None:
         try:
             uploaded_refer = pd.read_csv(refer_upload).iloc[:, :2]
             uploaded_refer.columns = ["ErrorText", "Theme"]
+
+            st.sidebar.caption(f"Uploaded refer rows: **{len(uploaded_refer)}**")
+
             missing, mismatched, diff = validate_new_refer(current_refer_df, uploaded_refer)
             if missing == 0 and mismatched == 0:
                 st.sidebar.success("New Refer contains all current mappings. Click below to persist it.")
-                if st.sidebar.button("Persist NEW Refer as Main"):
+                if st.sidebar.button("✅ Persist NEW Refer as Main (validated)"):
                     persist_refer_df(uploaded_refer)
                     current_refer_df, refer_status = load_current_refer_df()
                     st.sidebar.success("New Refer saved as main.")
@@ -210,6 +227,9 @@ else:
                     f"Refer validation failed: missing={missing}, mismatched={mismatched}. "
                     "The new refer must include all current rows with identical themes."
                 )
+                # Show a quick preview of what's missing/mismatched
+                with st.sidebar.expander("See missing/mismatched details"):
+                    st.write(diff.head(50))
                 if not diff.empty:
                     st.sidebar.download_button(
                         "Download validation_diff.csv",
@@ -217,6 +237,11 @@ else:
                         file_name="validation_diff.csv",
                         mime="text/csv",
                     )
+                # Offer a skip-validation overwrite for cases where you KNOW you want to replace it
+                if st.sidebar.button("⚠️ Overwrite Main Refer with Uploaded (skip validation)"):
+                    persist_refer_df(uploaded_refer)
+                    current_refer_df, refer_status = load_current_refer_df()
+                    st.sidebar.success("Overwrote main refer with uploaded file.")
         except Exception as e:
             st.sidebar.error(f"Failed to read/validate uploaded Refer: {e}")
 
