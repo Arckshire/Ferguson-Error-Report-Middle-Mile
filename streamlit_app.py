@@ -2,7 +2,7 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-from io import BytesIO, StringIO
+from io import BytesIO
 from pathlib import Path
 from datetime import datetime
 from zipfile import ZipFile, ZIP_DEFLATED
@@ -12,59 +12,35 @@ from zipfile import ZipFile, ZIP_DEFLATED
 # =========================
 st.set_page_config(page_title="Ferguson Weekly Report Builder", layout="wide")
 
-# =========================
-# Embedded MASTER Refer (from your uploaded CSV)
-#  - This will be auto-persisted to disk as refer_store.csv on first run.
-#  - No download button anywhere.
-# =========================
-DEFAULT_REFER_CSV = """ErrorText,Theme
-"P44(An error occurred while dispatching this... Windows","Appointment Windows"
-"P44(The vendor has returned an error.)VENDOR(USE U","Appointment Window / Scheduling"
-"""
-
-# ^^^ NOTE:
-# I truncated this header to keep the sample short here in chat.
-# In your actual app, paste the ENTIRE CSV I generated for you (the one from your upload).
-# It starts with:
-# ErrorText,Theme
-# "P44(An error occurred while dispatching this... Windows","Appointment Windows"
-# ...
-# and is ~49k characters long. Replace the DEFAULT_REFER_CSV block above with the full text I gave you.
-
 REFER_STORE_PATH = Path("refer_store.csv")
 
 # =========================
 # Helpers
 # =========================
 def persist_refer_df(df: pd.DataFrame) -> None:
+    """Persist the 2-column refer mapping to disk."""
     df = df.iloc[:, :2].copy()
     df.columns = ["ErrorText", "Theme"]
     df.to_csv(REFER_STORE_PATH, index=False)
 
-def load_current_refer_df() -> tuple[pd.DataFrame, str]:
+def load_current_refer_df():
     """
-    Load the current main refer.
-    Priority: disk -> embedded default (and bootstrap to disk if not present).
+    Load the current main refer from disk.
+    Returns (df or None, status_text).
     """
     if REFER_STORE_PATH.exists():
         df = pd.read_csv(REFER_STORE_PATH).iloc[:, :2]
         df.columns = ["ErrorText", "Theme"]
         ts = datetime.fromtimestamp(REFER_STORE_PATH.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S")
         return df, f"On disk (last updated: {ts})"
-
-    # Bootstrap: persist embedded default as the main refer on first run
-    df = pd.read_csv(StringIO(DEFAULT_REFER_CSV), comment="#").iloc[:, :2]
-    df.columns = ["ErrorText", "Theme"]
-    persist_refer_df(df)
-    ts = datetime.fromtimestamp(REFER_STORE_PATH.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S")
-    return df, f"Embedded default (bootstrapped to disk: {ts})"
+    return None, "Not set — please upload a Refer CSV to initialize."
 
 def _norm_series(s: pd.Series) -> pd.Series:
     # Normalize to reduce spurious mismatches for validation
     return (
         s.astype(str)
          .str.replace(r"\s+", " ", regex=True)  # collapse multi-space
-         .str.replace("\u00A0", " ")            # NBSP to normal space
+         .str.replace("\u00A0", " ")            # NBSP to space
          .str.strip()
     )
 
@@ -144,17 +120,25 @@ def build_sheet3_server_errors(server_df: pd.DataFrame, refer_df: pd.DataFrame) 
         base_cols = df.columns.tolist()[:3]
     count_col = base_cols[2]
     df[count_col] = pd.to_numeric(df[count_col], errors="coerce").fillna(0)
+
     total_errors = df[count_col].sum()
     df["% of Total Errors"] = np.where(total_errors > 0, df[count_col] / total_errors, 0.0)
+
+    # Exact Theme lookup (server errors: use column B)
     refer_map = dict(zip(refer_df.iloc[:, 0].astype(str).str.strip(), refer_df.iloc[:, 1].astype(str).str.strip()))
     text_col = base_cols[1] if len(base_cols) > 1 else base_cols[0]
     keys = df[text_col].astype(str).str.strip()
+
     exact_theme = keys.map(refer_map).replace({np.nan: ""})
     df["Theme"] = exact_theme
     df["MatchType"] = np.where(df["Theme"].astype(str).str.len() > 0, "Exact", "NotExact")
+
+    # Smart classification for NotExact
     mask = df["MatchType"] == "NotExact"
     df.loc[mask, "Theme"] = df.loc[mask, text_col].astype(str).map(classify_theme_freeform)
+
     df["Needs Review"] = np.where(df["MatchType"] == "NotExact", "Yes", "")
+
     return df[base_cols + ["% of Total Errors", "Theme", "MatchType", "Needs Review"]]
 
 def to_excel_openpyxl(sheets: dict[str, pd.DataFrame]) -> bytes:
@@ -185,44 +169,56 @@ st.caption("Download CSVs (zip) or create one Excel workbook. Uses openpyxl only
 
 # Sidebar: Refer control (NO download of refer)
 st.sidebar.header("Refer Sheet Control (Theme Mapping)")
-current_refer_df, refer_source = load_current_refer_df()
-st.sidebar.markdown(f"**Current refer source:** {refer_source}")
-if REFER_STORE_PATH.exists():
-    ts = datetime.fromtimestamp(REFER_STORE_PATH.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S")
-    st.sidebar.info(f"Main refer last updated: {ts}")
-else:
-    st.sidebar.info("Main refer not yet saved on disk — using embedded default (auto-bootstrapped).")
+current_refer_df, refer_status = load_current_refer_df()
+st.sidebar.markdown(f"**Refer status:** {refer_status}")
 
 refer_upload = st.sidebar.file_uploader(
-    "Optional: Upload a NEW refer CSV (two columns: ErrorText, Theme)",
+    "Upload Refer CSV (two columns: ErrorText, Theme)",
     type=["csv"],
     key="refer_upload"
 )
-if refer_upload is not None:
+
+# First-time initialization: if no refer exists, require an upload and auto-persist it
+if current_refer_df is None:
+    if refer_upload is None:
+        st.warning("No Refer is set yet. Please upload your Refer CSV in the sidebar to initialize the app.")
+        st.stop()
     try:
         uploaded_refer = pd.read_csv(refer_upload).iloc[:, :2]
         uploaded_refer.columns = ["ErrorText", "Theme"]
-        missing, mismatched, diff = validate_new_refer(current_refer_df, uploaded_refer)
-        if missing == 0 and mismatched == 0:
-            st.sidebar.success("Refer validation passed: new file contains all current mappings (you may have added more — that's fine).")
-            if st.sidebar.button("Make uploaded refer the MAIN refer (persist)"):
-                persist_refer_df(uploaded_refer)
-                current_refer_df = uploaded_refer
-                st.sidebar.success("Uploaded refer saved as main. It will be used by default next time.")
-        else:
-            st.sidebar.error(
-                f"Refer validation failed: missing={missing}, mismatched={mismatched}. "
-                "The new refer must include all current rows with identical themes."
-            )
-            if not diff.empty:
-                st.sidebar.download_button(
-                    "Download validation_diff.csv",
-                    diff.to_csv(index=False).encode("utf-8"),
-                    file_name="validation_diff.csv",
-                    mime="text/csv",
-                )
+        persist_refer_df(uploaded_refer)
+        current_refer_df, refer_status = load_current_refer_df()
+        st.success("Refer initialized and saved as main.")
     except Exception as e:
-        st.sidebar.error(f"Failed to read/validate uploaded refer: {e}")
+        st.error(f"Failed to read/persist uploaded Refer: {e}")
+        st.stop()
+else:
+    # If a refer already exists, allow replacing it with a superset that matches all current rows/themes.
+    if refer_upload is not None:
+        try:
+            uploaded_refer = pd.read_csv(refer_upload).iloc[:, :2]
+            uploaded_refer.columns = ["ErrorText", "Theme"]
+            missing, mismatched, diff = validate_new_refer(current_refer_df, uploaded_refer)
+            if missing == 0 and mismatched == 0:
+                st.sidebar.success("New Refer contains all current mappings. Click below to persist it.")
+                if st.sidebar.button("Persist NEW Refer as Main"):
+                    persist_refer_df(uploaded_refer)
+                    current_refer_df, refer_status = load_current_refer_df()
+                    st.sidebar.success("New Refer saved as main.")
+            else:
+                st.sidebar.error(
+                    f"Refer validation failed: missing={missing}, mismatched={mismatched}. "
+                    "The new refer must include all current rows with identical themes."
+                )
+                if not diff.empty:
+                    st.sidebar.download_button(
+                        "Download validation_diff.csv",
+                        diff.to_csv(index=False).encode("utf-8"),
+                        file_name="validation_diff.csv",
+                        mime="text/csv",
+                    )
+        except Exception as e:
+            st.sidebar.error(f"Failed to read/validate uploaded Refer: {e}")
 
 # Main inputs
 st.subheader("1) Upload CSVs")
@@ -268,7 +264,7 @@ if run:
         "Dispatch_Success_Rate_By_Carrie": sheet1,
         "Shipment_Level_Errors": sheet2,
         "Server_Tender_Errors": sheet3,
-        "Refer": current_refer_df,  # only included if explicitly requested for Excel/ZIP
+        "Refer": current_refer_df,  # only included if explicitly requested
     }
 
     if output_mode == "ZIP of CSVs (recommended)":
