@@ -18,6 +18,15 @@ REFER_STORE_PATH = Path("refer_store.csv")
 # =========================
 # Session helpers
 # =========================
+def _norm_series(s: pd.Series) -> pd.Series:
+    # Normalize to reduce spurious mismatches for validation
+    return (
+        s.astype(str)
+         .str.replace(r"\s+", " ", regex=True)  # collapse multi-space
+         .str.replace("\u00A0", " ")            # NBSP to normal space
+         .str.strip()
+    )
+
 def df_hash(df: pd.DataFrame) -> str:
     """Stable hash of a 2-col refer DF after normalization and ordering by ErrorText."""
     if df is None or df.empty:
@@ -28,7 +37,8 @@ def df_hash(df: pd.DataFrame) -> str:
     norm["Theme"] = _norm_series(norm["Theme"])
     norm = norm.sort_values("ErrorText", kind="mergesort").reset_index(drop=True)
     csv_bytes = norm.to_csv(index=False).encode("utf-8")
-    return hashlib.md5(csv_bytes).hexdigest()
+    import hashlib as _hashlib
+    return _hashlib.md5(csv_bytes).hexdigest()
 
 # =========================
 # Helpers
@@ -56,15 +66,6 @@ def reset_refer():
     if REFER_STORE_PATH.exists():
         REFER_STORE_PATH.unlink()
 
-def _norm_series(s: pd.Series) -> pd.Series:
-    # Normalize to reduce spurious mismatches for validation
-    return (
-        s.astype(str)
-         .str.replace(r"\s+", " ", regex=True)  # collapse multi-space
-         .str.replace("\u00A0", " ")            # NBSP to normal space
-         .str.strip()
-    )
-
 def validate_new_refer(current_refer: pd.DataFrame, new_refer: pd.DataFrame):
     """
     New refer must contain ALL existing ErrorText rows with IDENTICAL themes.
@@ -78,7 +79,6 @@ def validate_new_refer(current_refer: pd.DataFrame, new_refer: pd.DataFrame):
     cur["ErrorText"] = _norm_series(cur["ErrorText"]); cur["Theme_old"] = _norm_series(cur["Theme_old"])
     new["ErrorText"] = _norm_series(new["ErrorText"]); new["Theme_new"] = _norm_series(new["Theme_new"])
 
-    # left-join ensures all current keys must be present in new
     left = cur.merge(new, on="ErrorText", how="left")
     missing_mask = left["Theme_new"].isna()
     mismatched_mask = (~missing_mask) & (left["Theme_old"].astype(str) != left["Theme_new"].astype(str))
@@ -130,8 +130,16 @@ def build_sheet1_dispatch(current_df: pd.DataFrame, last_df: pd.DataFrame) -> pd
         "p44 Benchmark - Low", "p44 Benchmark - High", "p44 Benchmark - Best in Class"
     ]]
 
-def build_sheet2_empty() -> pd.DataFrame:
-    return pd.DataFrame(columns=["(leave empty, you'll paste here)"])
+def build_sheet2_shipment_errors(ship_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Drop columns B, C, D, E, and O (Excel letters) from the uploaded Shipment Level Errors file.
+    That corresponds to 0-based indexes 1,2,3,4,14 if they exist.
+    """
+    drop_idx = {1, 2, 3, 4, 14}  # guard against short files
+    cols = ship_df.columns.tolist()
+    keep_cols = [c for i, c in enumerate(cols) if i not in drop_idx]
+    out = ship_df[keep_cols].copy()
+    return out
 
 def build_sheet3_server_errors(server_df: pd.DataFrame, refer_df: pd.DataFrame) -> pd.DataFrame:
     base_cols = server_df.columns.tolist()[:3]
@@ -144,6 +152,7 @@ def build_sheet3_server_errors(server_df: pd.DataFrame, refer_df: pd.DataFrame) 
     df[count_col] = pd.to_numeric(df[count_col], errors="coerce").fillna(0)
 
     total_errors = df[count_col].sum()
+    # Keep as a fraction (e.g., 0.08) so Excel % format shows 8.00%
     df["% of Total Errors"] = np.where(total_errors > 0, df[count_col] / total_errors, 0.0)
 
     # Exact Theme lookup (server errors: use column B)
@@ -164,11 +173,26 @@ def build_sheet3_server_errors(server_df: pd.DataFrame, refer_df: pd.DataFrame) 
     return df[base_cols + ["% of Total Errors", "Theme", "MatchType", "Needs Review"]]
 
 def to_excel_openpyxl(sheets: dict[str, pd.DataFrame]) -> bytes:
-    """Write Excel using openpyxl ONLY (no xlsxwriter dependency)."""
+    """Write Excel using openpyxl ONLY (no xlsxwriter dependency). Also format % column."""
     output = BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         for sheet_name, sheet_df in sheets.items():
             sheet_df.to_excel(writer, sheet_name=sheet_name[:31], index=False)
+
+        # Apply percent format to Server_Tender_Errors column D ("%-of-Total Errors")
+        try:
+            wb = writer.book
+            ws = writer.sheets.get("Server_Tender_Errors")
+            if ws is not None:
+                # Column D = 4th column. Format rows 2..N as percentage with two decimals.
+                from openpyxl.styles import numbers
+                for row in ws.iter_rows(min_row=2, max_row=ws.max_row, min_col=4, max_col=4):
+                    for cell in row:
+                        cell.number_format = numbers.FORMAT_PERCENTAGE_00
+        except Exception:
+            # non-fatal if formatting can't be applied
+            pass
+
     return output.getvalue()
 
 def to_zip_csvs(sheets: dict[str, pd.DataFrame], include_refer: bool = False) -> bytes:
@@ -195,7 +219,6 @@ st.sidebar.header("Refer Sheet Control (Theme Mapping)")
 # Reset
 if st.sidebar.button("🔁 Reset Main Refer (delete saved refer_store.csv)"):
     reset_refer()
-    # Also clear any remembered hashes
     st.session_state.pop("refer_hash", None)
     st.sidebar.success("Deleted refer_store.csv. Upload and initialize a new Refer.")
 
@@ -233,7 +256,6 @@ if current_refer_df is None:
 else:
     # A refer exists. Only validate/overwrite when you click a button.
     if refer_upload is not None:
-        # Read uploaded refer but do nothing unless a button is clicked
         try:
             candidate_refer = pd.read_csv(refer_upload).iloc[:, :2]
             candidate_refer.columns = ["ErrorText", "Theme"]
@@ -242,7 +264,6 @@ else:
 
             # Validate & Use
             if st.sidebar.button("🧪 Validate & Use Uploaded Refer"):
-                # Skip validation if identical to current (same hash)
                 if cand_hash == st.session_state.get("refer_hash", ""):
                     st.sidebar.info("Uploaded refer is identical to the current main refer. Nothing to update.")
                 else:
@@ -278,13 +299,15 @@ else:
 
 # --- Main inputs ---
 st.subheader("1) Upload CSVs")
-col1, col2, col3 = st.columns(3)
+col1, col2, col3, col4 = st.columns(4)
 with col1:
     current_week_file = st.file_uploader("Current Week: Dispatch Success Rate by Carrier SCAC", type=["csv"], key="cur")
 with col2:
     last_week_file = st.file_uploader("Last Week: Dispatch Success Rate by Carrier SCAC", type=["csv"], key="last")
 with col3:
     server_errors_file = st.file_uploader("Server Tender Response Errors", type=["csv"], key="serr")
+with col4:
+    shipment_errors_file = st.file_uploader("Shipment Level Errors (to clean)", type=["csv"], key="ship")
 
 output_mode = st.radio("2) Choose output", ["ZIP of CSVs (recommended)", "One Excel workbook (openpyxl)"], index=0)
 include_refer_in_excel = st.checkbox("Include Refer sheet in Excel", value=False)
@@ -292,14 +315,15 @@ include_refer_in_excel = st.checkbox("Include Refer sheet in Excel", value=False
 run = st.button("Build Output")
 
 if run:
-    if not (current_week_file and last_week_file and server_errors_file):
-        st.error("Please upload all three CSVs to proceed.")
+    if not (current_week_file and last_week_file and server_errors_file and shipment_errors_file):
+        st.error("Please upload all four CSVs to proceed (current, last, server errors, shipment errors).")
         st.stop()
 
     # Read inputs
     cur = pd.read_csv(current_week_file)
     last = pd.read_csv(last_week_file)
     serr = pd.read_csv(server_errors_file)
+    ship = pd.read_csv(shipment_errors_file)
 
     # Build sheets
     try:
@@ -308,7 +332,11 @@ if run:
         st.error(f"Failed to build Sheet 1 (Dispatch Success Rate): {e}")
         st.stop()
 
-    sheet2 = build_sheet2_empty()
+    try:
+        sheet2 = build_sheet2_shipment_errors(ship)
+    except Exception as e:
+        st.error(f"Failed to build Sheet 2 (Shipment Level Errors): {e}")
+        st.stop()
 
     try:
         sheet3 = build_sheet3_server_errors(serr, current_refer_df)
@@ -320,7 +348,7 @@ if run:
         "Dispatch_Success_Rate_By_Carrie": sheet1,
         "Shipment_Level_Errors": sheet2,
         "Server_Tender_Errors": sheet3,
-        "Refer": current_refer_df,  # only included if explicitly requested
+        "Refer": current_refer_df,  # only included if explicitly requested for Excel/ZIP
     }
 
     if output_mode == "ZIP of CSVs (recommended)":
@@ -365,6 +393,8 @@ if run:
     # Quick previews
     with st.expander("Preview: Dispatch_Success_Rate_By_Carrie"):
         st.dataframe(sheet1, use_container_width=True)
+    with st.expander("Preview: Shipment_Level_Errors"):
+        st.dataframe(sheet2, use_container_width=True)
     with st.expander("Preview: Server_Tender_Errors"):
         st.dataframe(sheet3, use_container_width=True)
 
